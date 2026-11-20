@@ -1,202 +1,81 @@
 
-from flask import Flask, request, redirect, render_template_string
-import subprocess
+from flask import Flask, request, redirect, render_template_string, flash
 import sqlite3
+import subprocess
 import re
 import ipaddress
+import os
+import platform
 from datetime import datetime
 
-app = Flask(__name__)
-import os
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(BASE_DIR, "hotspot.db")
-HOTSPOT_SUBNET = "192.168.137.0/24"
+DB_PATH = os.path.join(BASE_DIR, "hotspot_manager.db")
+HOTSPOT_SUBNET = os.environ.get(
+    "HOTSPOT_SUBNET", "192.168.137.0/24"
+)
 
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Hotspot Device Manager</title>
-<style>
-body {
-    background:#101827;
-    color:white;
-    font-family:Arial;
-    padding:25px;
-}
-.container {
-    max-width:1100px;
-    margin:auto;
-}
-.card {
-    background:#1c293b;
-    padding:20px;
-    border-radius:12px;
-    margin-bottom:20px;
-}
-h1 { color:#60a5fa; }
-table {
-    width:100%;
-    border-collapse:collapse;
-}
-th,td {
-    padding:13px;
-    border-bottom:1px solid #39475a;
-    text-align:left;
-}
-button {
-    padding:9px 12px;
-    border:0;
-    border-radius:6px;
-    cursor:pointer;
-    color:white;
-}
-.allow {background:#16a34a;}
-.block {background:#dc2626;}
-.remove {background:#475569;}
-.refresh {background:#2563eb;}
-input {
-    padding:10px;
-    border-radius:5px;
-    border:0;
-    margin:5px;
-}
-.allowed {color:#4ade80;}
-.blocked {color:#f87171;}
-.unknown {color:#facc15;}
-.notice {
-    background:#423719;
-    padding:12px;
-    border-radius:8px;
-    line-height:1.5;
-}
-</style>
-</head>
-<body>
-<div class="container">
+app = Flask(__name__)
+app.secret_key = os.environ.get(
+    "FLASK_SECRET", "local-dashboard-change-this"
+)
 
-<h1>HOTSPOT DEVICE MANAGER</h1>
-<p>Windows Mobile Hotspot Administration</p>
+# Database
+def connect_db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
 
-<div class="notice">
-Monitoring menggunakan Windows ARP cache.
-Blacklist dan whitelist disimpan sebagai daftar kebijakan,
-belum memutus atau mengizinkan koneksi secara langsung.
-</div>
-
-<div class="card">
-<h2>Device Monitoring</h2>
-
-<form action="/scan" method="post">
-<button class="refresh">Refresh Devices</button>
-</form>
-
-<p>Total perangkat terdeteksi: {{ devices|length }}</p>
-
-<table>
-<tr>
-<th>IP Address</th>
-<th>MAC Address</th>
-<th>Policy</th>
-<th>Action</th>
-</tr>
-
-{% for d in devices %}
-<tr>
-<td>{{d.ip}}</td>
-<td>{{d.mac}}</td>
-<td>
-{% if d.policy == 'allow' %}
-<span class="allowed">WHITELIST</span>
-{% elif d.policy == 'block' %}
-<span class="blocked">BLACKLIST</span>
-{% else %}
-<span class="unknown">UNLISTED</span>
-{% endif %}
-</td>
-<td>
-<form action="/policy" method="post">
-<input type="hidden" name="mac" value="{{d.mac}}">
-<button class="allow" name="policy" value="allow">
-Whitelist
-</button>
-<button class="block" name="policy" value="block">
-Blacklist
-</button>
-</form>
-</td>
-</tr>
-{% endfor %}
-</table>
-</div>
-
-<div class="card">
-<h2>Add Device Manually</h2>
-
-<form action="/policy" method="post">
-<input name="mac" placeholder="MAC Address" required>
-<select name="policy">
-<option value="allow">Whitelist</option>
-<option value="block">Blacklist</option>
-</select>
-<button class="refresh">Save</button>
-</form>
-</div>
-
-<div class="card">
-<h2>Saved Policies</h2>
-<table>
-<tr>
-<th>MAC Address</th>
-<th>Policy</th>
-<th>Action</th>
-</tr>
-{% for p in policies %}
-<tr>
-<td>{{p[0]}}</td>
-<td>{{p[1]}}</td>
-<td>
-<form action="/remove" method="post">
-<input type="hidden" name="mac" value="{{p[0]}}">
-<button class="remove">Remove</button>
-</form>
-</td>
-</tr>
-{% endfor %}
-</table>
-</div>
-
-<p>Last updated: {{now}}</p>
-</div>
-</body>
-</html>
-"""
-
-def database():
-    os.makedirs(BASE_DIR, exist_ok=True)
-    con = sqlite3.connect(DB)
     con.execute("""
-    CREATE TABLE IF NOT EXISTS policies (
-        mac TEXT PRIMARY KEY,
-        policy TEXT NOT NULL
-    )
+        CREATE TABLE IF NOT EXISTS policies(
+            mac TEXT PRIMARY KEY,
+            label TEXT DEFAULT '',
+            policy TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
     """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS activity(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT,
+            details TEXT,
+            created_at TEXT
+        )
+    """)
+
     con.commit()
     return con
 
 
-def normalize_mac(mac):
-    mac = mac.strip().upper().replace("-", ":")
+def log_activity(action, details):
+    with connect_db() as con:
+        con.execute(
+            "INSERT INTO activity(action,details,created_at) VALUES(?,?,?)",
+            (action, details,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+
+
+# MAC validation
+def normalize_mac(value):
+    value = value.strip().upper().replace("-", ":")
+
     if not re.fullmatch(
-        r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", mac
+        r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", value
     ):
         raise ValueError("Invalid MAC address")
-    return mac
+
+    return value
 
 
-def get_devices():
-    devices = {}
+# Device scanner
+def scan_neighbors():
+
+    if platform.system() != "Windows":
+        return []
+
+    network = ipaddress.ip_network(
+        HOTSPOT_SUBNET, strict=False
+    )
 
     try:
         output = subprocess.check_output(
@@ -205,124 +84,199 @@ def get_devices():
             errors="ignore",
             timeout=5
         )
+    except Exception:
+        return []
 
-        network = ipaddress.ip_network(
-            HOTSPOT_SUBNET, strict=False
-        )
+    found = {}
 
-        for line in output.splitlines():
-            match = re.search(
-                r"(\d+\.\d+\.\d+\.\d+)\s+"
-                r"([0-9a-fA-F-]{17})\s+(dynamic|static)",
-                line,
-                re.I
-            )
+    pattern = re.compile(
+        r"(\d{1,3}(?:\.\d{1,3}){3})\s+"
+        r"([0-9a-fA-F-]{17})\s+(dynamic|static)",
+        re.I
+    )
 
-            if match:
-                ip = match.group(1)
-                mac = normalize_mac(match.group(2))
+    for line in output.splitlines():
 
-                if ipaddress.ip_address(ip) in network:
-                    devices[mac] = ip
+        match = pattern.search(line)
 
-    except Exception as error:
-        print("Scan error:", error)
+        if not match:
+            continue
 
-    return devices
+        try:
+            ip = ipaddress.ip_address(match.group(1))
+
+            if ip not in network:
+                continue
+
+            mac = normalize_mac(match.group(2))
+            found[mac] = str(ip)
+
+        except ValueError:
+            continue
+
+    return [
+        {"ip": ip, "mac": mac}
+        for mac, ip in found.items()
+    ]
 
 
-def get_policies():
-    con = database()
-    rows = con.execute(
-        "SELECT mac, policy FROM policies"
-    ).fetchall()
-    con.close()
-    return dict(rows)
-
-
+# Dashboard
 @app.route("/")
 def dashboard():
 
-    devices = get_devices()
-    policies = get_policies()
+    devices = scan_neighbors()
 
-    device_list = []
+    with connect_db() as con:
+        policies = con.execute(
+            "SELECT * FROM policies ORDER BY updated_at DESC"
+        ).fetchall()
 
-    for mac, ip in devices.items():
-        device_list.append({
-            "ip": ip,
-            "mac": mac,
-            "policy": policies.get(mac, "unknown")
-        })
+        logs = con.execute(
+            "SELECT * FROM activity ORDER BY id DESC LIMIT 12"
+        ).fetchall()
+
+    policy_map = {
+        p["mac"]: p["policy"] for p in policies
+    }
+
+    for device in devices:
+        device["policy"] = policy_map.get(
+            device["mac"], "none"
+        )
 
     return render_template_string(
         HTML,
-        devices=device_list,
-        policies=[
-            (mac, policy)
-            for mac, policy in policies.items()
-        ],
-        now=datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+        devices=devices,
+        policies=policies,
+        logs=logs,
+        subnet=HOTSPOT_SUBNET,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        allow_count=sum(p["policy"] == "allow" for p in policies),
+        block_count=sum(p["policy"] == "block" for p in policies)
     )
 
 
-@app.route("/scan", methods=["POST"])
-def scan():
+# Refresh
+@app.post("/scan")
+def refresh_scan():
+
+    count = len(scan_neighbors())
+
+    log_activity(
+        "REFRESH",
+        f"ARP scan found {count} entries"
+    )
+
+    flash(f"Scan selesai: {count} entri ARP.")
     return redirect("/")
 
 
-@app.route("/policy", methods=["POST"])
-def policy():
+# Whitelist / Blacklist
+@app.post("/policy")
+def save_policy():
 
     try:
-        mac = normalize_mac(request.form["mac"])
-        selected = request.form["policy"]
+        mac = normalize_mac(request.form.get("mac", ""))
+        policy = request.form.get("policy", "")
+        label = request.form.get("label", "").strip()[:80]
 
-        if selected not in ["allow", "block"]:
-            return "Invalid policy", 400
+        if policy not in ("allow", "block"):
+            raise ValueError("Invalid policy")
 
-        con = database()
+        with connect_db() as con:
+            con.execute("""
+                INSERT INTO policies(
+                    mac,label,policy,updated_at
+                )
+                VALUES(?,?,?,?)
+                ON CONFLICT(mac)
+                DO UPDATE SET
+                    label=excluded.label,
+                    policy=excluded.policy,
+                    updated_at=excluded.updated_at
+            """, (
+                mac,
+                label,
+                policy,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ))
 
-        con.execute("""
-        INSERT INTO policies(mac, policy)
-        VALUES (?, ?)
-        ON CONFLICT(mac)
-        DO UPDATE SET policy=excluded.policy
-        """, (mac, selected))
+        log_activity(
+            "POLICY",
+            f"{mac} set to {policy}"
+        )
 
-        con.commit()
-        con.close()
+        flash(
+            f"{mac} saved. Policy is recorded only, "
+            "not enforced by Windows hotspot."
+        )
 
     except ValueError as error:
-        return str(error), 400
+        flash(str(error))
 
     return redirect("/")
 
 
-@app.route("/remove", methods=["POST"])
-def remove():
+# Remove policy
+@app.post("/remove")
+def remove_policy():
 
-    mac = normalize_mac(request.form["mac"])
+    try:
+        mac = normalize_mac(request.form.get("mac", ""))
 
-    con = database()
-    con.execute(
-        "DELETE FROM policies WHERE mac=?",
-        (mac,)
-    )
-    con.commit()
-    con.close()
+        with connect_db() as con:
+            con.execute(
+                "DELETE FROM policies WHERE mac=?",
+                (mac,)
+            )
+
+        log_activity("REMOVE", f"Removed {mac}")
+        flash("Policy removed.")
+
+    except ValueError as error:
+        flash(str(error))
+
+    return redirect("/")
+
+
+# Open Windows hotspot settings
+@app.route("/open-hotspot-settings")
+def open_hotspot_settings():
+
+    if platform.system() != "Windows":
+        flash("Windows only.")
+        return redirect("/")
+
+    try:
+        os.startfile(
+            "ms-settings:network-mobilehotspot"
+        )
+
+        log_activity(
+            "OPEN SETTINGS",
+            "Opened Mobile Hotspot Settings"
+        )
+
+        flash(
+            "Windows Hotspot Settings opened. "
+            "Change SSID/password manually."
+        )
+
+    except OSError as error:
+        flash(str(error))
 
     return redirect("/")
 
 
 if __name__ == "__main__":
-    database()
 
-    print("Hotspot Device Manager Started")
-    print("Open: http://127.0.0.1:5000")
+    connect_db().close()
+
+    print("Hotspot Device Manager V2")
+    print("Open http://127.0.0.1:5000")
 
     app.run(
         host="127.0.0.1",
-        port=8080,
+        port=5000,
         debug=False
     )
